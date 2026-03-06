@@ -1,11 +1,17 @@
 package browser
 
 import (
+	"encoding/json"
 	"net/url"
 	"os"
+	"strings"
+	"sync"
 
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/go-rod/stealth"
 	"github.com/sirupsen/logrus"
-	"github.com/xpzouying/headless_browser"
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 )
 
@@ -14,6 +20,18 @@ type browserConfig struct {
 }
 
 type Option func(*browserConfig)
+
+type Browser struct {
+	browser  *rod.Browser
+	launcher *launcher.Launcher
+	isRemote bool
+}
+
+var remoteShared struct {
+	mu  sync.Mutex
+	url string
+	rod *rod.Browser
+}
 
 func WithBinPath(binPath string) Option {
 	return func(c *browserConfig) {
@@ -35,35 +53,100 @@ func maskProxyCredentials(proxyURL string) string {
 	return u.String()
 }
 
-func NewBrowser(headless bool, options ...Option) *headless_browser.Browser {
+func remoteBrowserURL() string {
+	if v := strings.TrimSpace(os.Getenv("CDP_URL")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("REMOTE_BROWSER_URL")); v != "" {
+		return v
+	}
+	return ""
+}
+
+func resolveControlURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "ws://") || strings.HasPrefix(raw, "wss://") {
+		return raw
+	}
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = "http://" + raw
+	}
+	return launcher.MustResolveURL(raw)
+}
+
+func loadCookiesOption() string {
+	cookiePath := cookies.GetCookiesFilePath()
+	cookieLoader := cookies.NewLoadCookie(cookiePath)
+	if data, err := cookieLoader.LoadCookies(); err == nil {
+		logrus.Debugf("loaded cookies from file successfully")
+		return string(data)
+	}
+	return ""
+}
+
+func applyCookies(b *rod.Browser, cookiesJSON string) {
+	if cookiesJSON == "" {
+		return
+	}
+	var networkCookies []*proto.NetworkCookie
+	if err := json.Unmarshal([]byte(cookiesJSON), &networkCookies); err != nil {
+		logrus.Warnf("failed to unmarshal cookies: %v", err)
+		return
+	}
+	b.MustSetCookies(networkCookies...)
+}
+
+func NewBrowser(headless bool, options ...Option) *Browser {
 	cfg := &browserConfig{}
 	for _, opt := range options {
 		opt(cfg)
 	}
 
-	opts := []headless_browser.Option{
-		headless_browser.WithHeadless(headless),
+	cookiesJSON := loadCookiesOption()
+
+	if remote := remoteBrowserURL(); remote != "" {
+		controlURL := resolveControlURL(remote)
+		remoteShared.mu.Lock()
+		defer remoteShared.mu.Unlock()
+
+		if remoteShared.rod == nil || remoteShared.url != controlURL {
+			remoteShared.rod = rod.New().ControlURL(controlURL).MustConnect()
+			remoteShared.url = controlURL
+			logrus.Infof("connected to remote browser via CDP: %s", remote)
+		}
+		applyCookies(remoteShared.rod, cookiesJSON)
+		return &Browser{browser: remoteShared.rod, isRemote: true}
 	}
+
+	l := launcher.New().Headless(headless).Set("--no-sandbox")
 	if cfg.binPath != "" {
-		opts = append(opts, headless_browser.WithChromeBinPath(cfg.binPath))
+		l = l.Bin(cfg.binPath)
 	}
-
-	// Read proxy from environment variable
 	if proxy := os.Getenv("XHS_PROXY"); proxy != "" {
-		opts = append(opts, headless_browser.WithProxy(proxy))
-		logrus.Infof("Using proxy: %s", maskProxyCredentials(proxy))
+		l = l.Proxy(proxy)
+		logrus.Infof("using proxy: %s", maskProxyCredentials(proxy))
 	}
 
-	// 加载 cookies
-	cookiePath := cookies.GetCookiesFilePath()
-	cookieLoader := cookies.NewLoadCookie(cookiePath)
+	controlURL := l.MustLaunch()
+	b := rod.New().ControlURL(controlURL).MustConnect()
+	applyCookies(b, cookiesJSON)
 
-	if data, err := cookieLoader.LoadCookies(); err == nil {
-		opts = append(opts, headless_browser.WithCookies(string(data)))
-		logrus.Debugf("loaded cookies from filesuccessfully")
-	} else {
-		logrus.Warnf("failed to load cookies: %v", err)
+	return &Browser{browser: b, launcher: l}
+}
+
+func (b *Browser) Close() {
+	if b == nil || b.browser == nil {
+		return
 	}
+	if b.isRemote {
+		return
+	}
+	b.browser.MustClose()
+	if b.launcher != nil {
+		b.launcher.Cleanup()
+	}
+}
 
-	return headless_browser.New(opts...)
+func (b *Browser) NewPage() *rod.Page {
+	return stealth.MustPage(b.browser)
 }
