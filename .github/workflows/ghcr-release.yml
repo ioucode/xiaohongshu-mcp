@@ -3,6 +3,8 @@ name: GHCR Release
 on:
   push:
     branches: [ main ]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -26,15 +28,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ioucode/xiaohongshu-mcp
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=main,enable={{is_default_branch}}
+            type=sha,format=long
+            type=sha,format=short
+            type=ref,event=tag
+
+      - name: Build and push AMD64 image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          tags: |
-            ghcr.io/ioucode/xiaohongshu-mcp:latest
-            ghcr.io/ioucode/xiaohongshu-mcp:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/ioucode/xiaohongshu-mcp:build-${{ github.sha }}-amd64
+          cache-from: type=gha,scope=ghcr-amd64
+          cache-to: type=gha,mode=max,scope=ghcr-amd64
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.arm64
+          push: true
+          platforms: linux/arm64
+          tags: ghcr.io/ioucode/xiaohongshu-mcp:build-${{ github.sha }}-arm64
+          cache-from: type=gha,scope=ghcr-arm64
+          cache-to: type=gha,mode=max,scope=ghcr-arm64
+
+      - name: Create and push multi-arch manifests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          amd64_image="ghcr.io/ioucode/xiaohongshu-mcp:build-${GITHUB_SHA}-amd64"
+          arm64_image="ghcr.io/ioucode/xiaohongshu-mcp:build-${GITHUB_SHA}-arm64"
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker buildx imagetools create -t "$tag" "$amd64_image" "$arm64_image"
+          done <<< "$TAGS"
+
+      - name: Inspect latest manifest
+        if: github.ref == 'refs/heads/main'
+        run: docker buildx imagetools inspect ghcr.io/ioucode/xiaohongshu-mcp:latest
